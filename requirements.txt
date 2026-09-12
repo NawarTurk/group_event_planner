@@ -1,0 +1,6 @@
+discord.py>=2.3.2
+aiohttp>=3.9.0
+python-dotenv>=1.0.1
+openai-agents>=0.8.4
+exa-py==2.14.0
+pytest>=8.4.2
