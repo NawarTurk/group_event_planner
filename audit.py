@@ -55,12 +55,18 @@ async def log_exa_completion(
     return await send_audit_log(guild, message)
 
 
-async def log_exa_ranking(message: discord.Message | None, location: str, timeframe: str, candidates: int, ranked: int) -> None:
-    """Update the real search audit only after Python has ranked its candidates."""
-    if message is None:
+async def log_exa_ranking(guild: discord.Guild | None, candidates: int, ranked: int) -> None:
+    """Record completed application validation of the agent's submitted comparisons."""
+    await send_audit_log(guild, f"📊 Ranked events | {candidates} candidates | {ranked} shown | Nawar + Akash compared")
+
+
+async def log_search_details(guild: discord.Guild | None, result: dict) -> None:
+    """Report only metadata returned by actual search executions."""
+    calls = result.get("calls", [])
+    if not calls:
         return
-    try:
-        await message.edit(content=f"🔎 Exa search | {_field(location)} | {_field(timeframe)} | ✅ {candidates} candidates, {ranked} ranked",
-                           allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        logger.warning("Audit log skipped: could not update Exa ranking count")
+    await send_audit_log(guild, f"📍 Event search | {_field(result['location'])} | {_field(result['date_or_timeframe'])} | {_field(result['timezone'])}")
+    for call in calls:
+        icon = "✅" if call["status"] == "ok" else "❌"
+        await send_audit_log(guild, f"🔎 Exa call {call['attempt']} | {icon} {call['status']} | {call['returned']} returned")
+    await send_audit_log(guild, f"📥 Events | {result['retrieved_count']} retrieved | {result['deduplicated_count']} usable after deduplication")

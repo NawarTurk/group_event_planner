@@ -1,6 +1,8 @@
 """Exa event discovery with conservative, page-backed field validation."""
 
 import asyncio
+import calendar
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ from exa_py import AsyncExa
 load_dotenv()
 logger = logging.getLogger(__name__)
 SEARCH_TIMEOUT_SECONDS = 30
+_event_timezone: ContextVar[str | None] = ContextVar("event_timezone", default=None)
 EVENT_FIELDS = ("title", "date", "time", "venue", "location", "activities", "food", "price", "setting", "vibe")
 SOURCE_PRIORITY = {"organizer": 0, "venue": 0, "municipal": 1, "tourism": 1, "ticketing": 2, "other": 3}
 EVENT_SCHEMA = {
@@ -29,10 +32,9 @@ EVENT_SCHEMA = {
             "including both the exact title and full date. Empty string if not available."
         )},
         "is_event": {"type": "boolean", "description": "True only for a real scheduled event, not an article or generic activity."},
-        "matches_request": {"type": "boolean", "description": "Event is in the requested city/region and timeframe. Ignore all personal preferences."},
         "source_type": {"type": "string", "enum": list(SOURCE_PRIORITY)},
     },
-    "required": [*EVENT_FIELDS, "date_evidence", "is_event", "matches_request", "source_type"],
+    "required": [*EVENT_FIELDS, "date_evidence", "is_event", "source_type"],
     "additionalProperties": False,
 }
 
@@ -43,7 +45,7 @@ def _normalized(text: str) -> str:
 
 
 def runtime_now() -> datetime:
-    return datetime.now(ZoneInfo(os.getenv("LOCAL_TIMEZONE") or "America/Toronto"))
+    return datetime.now(ZoneInfo(_event_timezone.get() or os.getenv("LOCAL_TIMEZONE") or "America/Toronto"))
 
 
 def default_location() -> str:
@@ -59,7 +61,7 @@ def _date_window(timeframe: str) -> tuple[date, date]:
     today = _today()
     phrase = " ".join(timeframe.casefold().split())
     if not phrase:
-        days = max(1, min(int(os.getenv("EVENT_SEARCH_DAYS") or "7"), 90))
+        days = max(1, min(int(os.getenv("EVENT_SEARCH_DAYS") or "30"), 90))
         return today, today + timedelta(days=days - 1)
     if phrase == "today":
         return today, today
@@ -69,16 +71,52 @@ def _date_window(timeframe: str) -> tuple[date, date]:
     if phrase == "this weekend":
         saturday = today + timedelta(days=5 - today.weekday())
         return max(today, saturday), saturday + timedelta(days=1)
+    if phrase == "this week":
+        return today, today + timedelta(days=6 - today.weekday())
     if phrase == "next week":
         monday = today + timedelta(days=7 - today.weekday())
         return monday, monday + timedelta(days=6)
-    parts = timeframe.split("/")
+    # Calendar month names are language syntax, never a fixed search period.
+    month_phrase = phrase.removeprefix("in ").removeprefix("this ")
+    words = month_phrase.split()
+    month_names = {name.casefold(): number for names in (calendar.month_name, calendar.month_abbr)
+                   for number, name in enumerate(names) if name}
+    if words and words[0] in month_names and len(words) <= 2:
+        month = month_names[words[0]]
+        year = int(words[1]) if len(words) == 2 else today.year + (month < today.month)
+        start = date(year, month, 1)
+        end = date(year, month, calendar.monthrange(year, month)[1])
+        if end < today:
+            raise ValueError("The requested month is in the past")
+        return max(start, today), end
+    parts = timeframe.strip().removeprefix("from ").replace(" to ", "/").split("/")
     if len(parts) not in (1, 2):
         raise ValueError("Invalid date range")
-    start, end = date.fromisoformat(parts[0]), date.fromisoformat(parts[-1])
-    if start > end or end < today:
-        raise ValueError("Invalid or past date range")
+    start, end = _source_date(parts[0]), _source_date(parts[-1])
+    if start is None or end is None or start > end or end < today:
+        raise ValueError("Unrecognized or past date range")
     return max(start, today), end
+
+
+async def location_timezone(location: str) -> str:
+    """Use the configured default city's timezone; geocode other cities without a key."""
+    configured_timezone = os.getenv("LOCAL_TIMEZONE")
+    if _normalized(location) == _normalized(default_location()) and configured_timezone:
+        return configured_timezone
+    if _normalized(location.split(",")[0]) == "montreal":
+        return "America/Toronto"
+    import aiohttp
+    from weather import _get_json
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        payload = await _get_json(session, "https://geocoding-api.open-meteo.com/v1/search",
+                                  {"name": location.split(",")[0].strip(), "count": 10, "language": "en"})
+    requested = {_normalized(part) for part in location.split(",") if part.strip()}
+    for place in payload.get("results", []):
+        names = {_normalized(str(place.get(key, ""))) for key in ("name", "admin1", "country")}
+        if requested <= names and place.get("timezone"):
+            ZoneInfo(place["timezone"])
+            return place["timezone"]
+    raise ValueError("Could not resolve the event city's timezone")
 
 
 def _source_date(value: str) -> date | None:
@@ -118,13 +156,10 @@ def _verify_results(results: list, location: str, start: date, end: date, limit:
             extracted = json.loads(page.summary) if isinstance(page.summary, str) else page.summary
             if not url or not isinstance(text, str) or not isinstance(extracted, dict):
                 continue
-            if extracted.get("is_event") is not True or extracted.get("matches_request") is not True:
+            if extracted.get("is_event") is not True:
                 continue
             fields = {name: _supported(extracted.get(name), text) for name in EVENT_FIELDS}
             if not all(fields[name] for name in ("title", "date", "location")):
-                continue
-            evidence = _supported(extracted.get("date_evidence"), text)
-            if not evidence or any(_normalized(fields[name]) not in _normalized(evidence) for name in ("title", "date")):
                 continue
             scheduled = _source_date(fields["date"])
             if scheduled is None or not max(start, _today()) <= scheduled <= end:
@@ -162,35 +197,27 @@ def _verify_results(results: list, location: str, start: date, end: date, limit:
     return events
 
 
-async def search_events(location: str = "", date_or_timeframe: str = "", max_results: int = 15) -> dict:
-    """Search broadly for current event candidates before any preference scoring.
-
-    The agent chooses this tool semantically for real event listings. No preference
-    values are accepted or sent to Exa. Use rank_events afterwards for independent
-    per-person comparisons. Missing optional fields never exclude an event.
-
-    Args:
-        location: Requested city/region, or empty to use DEFAULT_EVENT_LOCATION.
-        date_or_timeframe: today, tomorrow, this weekend, next week, an ISO date or
-            inclusive ISO date range. Empty uses the configured rolling window.
-            Pass relative phrases unchanged so Python resolves them at runtime.
-        max_results: Candidate pool size before ranking, normally 15 (minimum 3, maximum 30).
-    """
+async def _search_events(location: str = "", date_or_timeframe: str = "", max_results: int = 15) -> dict:
+    """Run broad retrieval and fallbacks inside the resolved location timezone."""
     location = location.strip() or default_location()
     if location.casefold() in ("montreal", "montréal"):
         location = "Montreal, Quebec, Canada"
     attempts = 0
+    call_records = []
+    pages = []
 
     def result(status: str, message: str, candidates: list[dict] | None = None) -> dict:
         return {"status": status, "location": location, "date_or_timeframe": date_or_timeframe,
                 "events": candidates or [], "candidate_count": len(candidates or []),
-                "search_attempts": attempts, "source": "Exa", "message": message}
+                "search_attempts": attempts, "source": "Exa", "message": message,
+                "timezone": str(runtime_now().tzinfo), "calls": call_records,
+                "retrieved_count": len(pages), "deduplicated_count": len(candidates or [])}
 
     try:
         start, end = _date_window(date_or_timeframe)
         date_or_timeframe = start.isoformat() if start == end else f"{start.isoformat()}/{end.isoformat()}"
     except (ValueError, KeyError):
-        return result("needs_clarification", "Clarify the timeframe or correct the local timezone configuration.")
+        return result("needs_clarification", "I could not interpret that timeframe. Which month or date range did you mean?")
     api_key = os.getenv("EXA_API_KEY", "").strip()
     if not api_key:
         return result("not_configured", "Live event search is not configured yet.")
@@ -199,11 +226,12 @@ async def search_events(location: str = "", date_or_timeframe: str = "", max_res
                 if secret and name.endswith(("TOKEN", "API_KEY", "SECRET")))):
         location = "withheld"
         return result("needs_clarification", "Use only a public city/region, without private data.")
-    limit = max(3, min(max_results, 30))
+    limit = max(1, min(max_results, 15))
     broad_query = f"Events in {location} from {start.isoformat()} through {end.isoformat()}"
     queries = [
         broad_query + ". Real event pages from organizers, venues, municipal or tourism sites and reputable ticketing pages.",
         broad_query,
+        broad_query + ". Any music OR art OR food OR movies OR technology OR social OR creative events; any one category is enough.",
     ]
     summary_query = (
         f"Extract ONE scheduled event in {location} between {start.isoformat()} and {end.isoformat()}. "
@@ -213,9 +241,9 @@ async def search_events(location: str = "", date_or_timeframe: str = "", max_res
         "Location must explicitly name the city and region where given. "
         "Missing food, price, setting, vibe or other optional details must be empty strings, not reasons to reject. "
         "Use is_event=false for articles, generic activity ideas or cancelled events. "
-        "date_evidence must be a contiguous verbatim excerpt tying the title to the scheduled date."
+        "Include a date_evidence excerpt when available; the title and full event date may appear separately on the event page."
     )
-    pages, candidates = [], []
+    candidates = []
     try:
         client = AsyncExa(api_key=api_key)
         async with client.client:
@@ -227,18 +255,53 @@ async def search_events(location: str = "", date_or_timeframe: str = "", max_res
                         contents={"text": {"max_characters": 20000}, "max_age_hours": 0,
                                   "summary": {"query": summary_query, "schema": EVENT_SCHEMA}},
                     ), timeout=SEARCH_TIMEOUT_SECONDS)
-                except Exception:
-                    if candidates:
-                        logger.warning("Exa retry failed; retaining verified first-search candidates")
-                        break
-                    raise
+                except Exception as exc:
+                    logger.warning("Exa attempt %s failed (%s); trying broader search", attempts, type(exc).__name__)
+                    call_records.append({"attempt": attempts, "status": "failed", "returned": 0})
+                    continue
                 pages.extend(response.results)
                 candidates = _verify_results(pages, location, start, end, limit)
+                call_records.append({"attempt": attempts, "status": "ok", "returned": len(response.results)})
                 if len(candidates) >= 3:
                     break
+        if not candidates and any(record["status"] == "failed" for record in call_records):
+            return result("failed", "Live event search could not complete all searches. Please try again later.")
         return result("ok" if candidates else "no_results",
                       "Compare every criterion for each person using rank_events; optional null fields are unconfirmed."
                       if candidates else "No verified upcoming local events found after broad search. Do not invent events.", candidates)
     except Exception as exc:
         logger.warning("Exa search failed (%s)", type(exc).__name__)
         return result("failed", "Live event search failed. Please try again later.")
+
+
+async def search_events(location: str = "", date_or_timeframe: str = "", max_results: int = 15) -> dict:
+    """Retrieve real events broadly; never filter by personal preference compatibility.
+
+    location: Public event city, or empty for the configurable default.
+    date_or_timeframe: Month name (optionally year), today, tomorrow, this week,
+        next week, this weekend, exact date or inclusive range. Empty means the next
+        30 days. Pass month/relative phrases unchanged; the event city's runtime
+        timezone determines the range. Do not ask for a specific date for a month.
+    max_results: Up to 15 factual candidates. Missing food, price, setting, vibe
+        or other optional details stay unknown. The OpenAI agent compares and ranks.
+    """
+    location = location.strip() or default_location()
+    if _normalized(location) == "montreal":
+        location = "Montreal, Quebec, Canada"
+    if len(location) > 120 or "\n" in location or any(
+        secret in location for name, secret in os.environ.items()
+        if secret and name.endswith(("TOKEN", "API_KEY", "SECRET"))
+    ):
+        return {"status": "needs_clarification", "location": "withheld", "events": [],
+                "message": "Use only a public city/region, without private data."}
+    try:
+        timezone = await location_timezone(location)
+    except Exception as exc:
+        logger.warning("Event location timezone unavailable (%s)", type(exc).__name__)
+        return {"status": "failed", "location": location, "events": [],
+                "message": "The event location lookup failed. Please try again."}
+    token = _event_timezone.set(timezone)
+    try:
+        return await _search_events(location, date_or_timeframe, max_results)
+    finally:
+        _event_timezone.reset(token)

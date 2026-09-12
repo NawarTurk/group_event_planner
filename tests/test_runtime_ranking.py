@@ -55,7 +55,7 @@ def assessment(row, criterion_id, status, field="activities", quote="Dancing"):
                       reason=f"{status} against the stated criterion", evidence_field=field, evidence_quote=quote)
 
 
-def test_or_scoring_each_user_unknown_fields_and_balanced_top_three():
+def test_agent_order_preserved_with_independent_unknown_fields():
     criteria = [criterion("a", "Person A", "Interests", "Enjoys dancing"),
                 criterion("b", "Person A", "Food", "Needs a meal"),
                 criterion("c", "Person B", "Interests", "Prefers sitting quietly")]
@@ -67,8 +67,8 @@ def test_or_scoring_each_user_unknown_fields_and_balanced_top_three():
               assessment(rows[2], "a", "match"), assessment(rows[3], "a", "conflict"),
               assessment(rows[0], "b", "match", "food", "meal")]
     ranked = rank_candidates(rows, preferences, criteria, checks)
-    assert [r["event"]["url"] for r in ranked] == [rows[1]["url"], rows[2]["url"], rows[0]["url"]]
-    traded = ranked[2]
+    assert [r["event"]["url"] for r in ranked] == [r["url"] for r in rows]
+    traded = ranked[0]
     assert traded["comparisons"]["Person A"][0]["status"] == "match"  # one match is enough
     assert traded["comparisons"]["Person B"][0]["status"] == "conflict"
     assert traded["comparisons"]["Person A"][1]["status"] == "unknown"
@@ -88,10 +88,10 @@ def test_unknown_does_not_change_score_and_missing_assessment_is_displayed():
 
 def test_cannot_invent_preferences_or_omit_source_messages():
     crit = criterion("a", "Person", "Food", "Old preference")
-    with pytest.raises(ValueError):
-        rank_candidates([event(1)], {"Person": ["Updated preference"]}, [crit], [])
-    with pytest.raises(ValueError):
-        rank_candidates([event(1)], {"Person": ["Updated preference"]}, [], [])
+    for criteria in ([crit], []):
+        result = rank_candidates([event(1)], {"Person": ["Updated preference"]}, criteria, [])
+        assert result[0]["comparisons"]["Person"][0]["status"] == "unknown"
+        assert result[0]["comparisons"]["Person"][0]["preference"] == "Updated preference"
 
 
 def test_dynamic_discord_edit_changes_next_ranking(monkeypatch):
@@ -115,19 +115,20 @@ def test_dynamic_discord_edit_changes_next_ranking(monkeypatch):
     assert a[0]["score"] > b[0]["score"]
 
 
-def test_fallback_is_once_and_contains_only_city_and_runtime_window(monkeypatch):
+def test_fallbacks_use_city_runtime_window_then_broad_or_categories(monkeypatch):
     day = date(2031, 3, 5)
     monkeypatch.setattr(events, "_today", lambda: day)
     monkeypatch.setenv("EXA_API_KEY", "mock-key")
     monkeypatch.setenv("DEFAULT_EVENT_LOCATION", "Example City")
+    monkeypatch.setenv("LOCAL_TIMEZONE", "America/Toronto")
     monkeypatch.setenv("EVENT_SEARCH_DAYS", "7")
     transport = AsyncMock(return_value={"results": []})
     monkeypatch.setattr(events.AsyncExa, "async_request", transport)
     result = asyncio.run(events.search_events())
     assert result["date_or_timeframe"] == f"{day}/{day + timedelta(days=6)}"
     assert result["location"] == "Example City"
-    assert result["search_attempts"] == 2
-    assert transport.await_count == 2
+    assert result["search_attempts"] == 3
+    assert transport.await_count == 3
     fallback = transport.call_args_list[1].args[1]["query"]
     assert fallback == f"Events in Example City from {day} through {day + timedelta(days=6)}"
     assert "Interests:" not in fallback and "Food:" not in fallback
@@ -172,10 +173,12 @@ def test_ranking_tool_updates_real_audit_and_sends_all_checks(monkeypatch):
         return SimpleNamespace(final_output="Model text is not the scorecard authority")
     monkeypatch.setattr(bot.Runner, "run", run)
     asyncio.run(bot.ask_agent(SimpleNamespace(content="Find events", channel=general, guild=guild)))
-    log_message.edit.assert_awaited_once()
-    assert "10 candidates, 3 ranked" in log_message.edit.call_args.kwargs["content"]
+    log_message.edit.assert_not_awaited()
+    assert "📊 Ranked events | 10 candidates | 3 shown | Nawar + Akash compared" in [c.args[0] for c in audit.send.call_args_list]
     general.send.assert_awaited_once()
-    assert general.send.call_args.args[0].count("✅ Interests:") == 3
+    call = general.send.call_args
+    text = call.args[0] if call.args else "\n".join(e.description for e in call.kwargs["embeds"])
+    assert text.count("✅ Interests:") == 3
 
 
 def test_production_has_no_fixed_calendar_dates_or_preference_fixtures():

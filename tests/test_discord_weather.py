@@ -1,3 +1,4 @@
+from event_weather import normalize_forecast_request
 """Exercise the real SDK tool loop with a deterministic model and mocked HTTP."""
 
 import asyncio
@@ -93,7 +94,7 @@ def test_montreal_now_calls_weather_once_and_sends_one_reply(monkeypatch, caplog
                               channel=SimpleNamespace(name="general", send=AsyncMock()))
     with caplog.at_level(logging.INFO):
         asyncio.run(bot.on_message(message))
-    lookup.assert_awaited_once_with("Montreal", "now", None)
+    lookup.assert_awaited_once_with(*normalize_forecast_request("Montreal", "now", None))
     message.channel.send.assert_awaited_once()
     assert model.calls == 2  # tool call, then natural-language response using its output
     assert "WEATHER TOOL CALLED: Montreal" in caplog.text
@@ -131,7 +132,7 @@ def test_model_can_choose_tool_or_answer_without_it(monkeypatch, user_text, use_
     asyncio.run(bot.ask_agent(message))
     assert lookup.await_count == int(use_tool)
     if use_tool:
-        lookup.assert_awaited_once_with("Montreal", date, None)
+        lookup.assert_awaited_once_with(*normalize_forecast_request("Montreal", date, None))
     message.channel.send.assert_awaited_once()
 
 

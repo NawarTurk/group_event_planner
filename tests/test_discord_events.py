@@ -114,10 +114,11 @@ def test_real_adapter_execution_generates_exactly_one_accurate_exa_log(monkeypat
         transport.side_effect = RuntimeError("mock-exa-credential PRIVATE-NAWAR")
     monkeypatch.setattr(events.AsyncExa, "async_request", transport)
     asyncio.run(bot.on_message(message))
-    assert transport.await_count == (0 if status == "not_configured" else 1 if status == "failed" else 2)
+    assert transport.await_count == (0 if status == "not_configured" else 3)
     logs = [call.args[0] for call in audit.send.call_args_list]
-    assert len(logs) == (3 if status == "ok" else 2)
-    assert logs[1] == expected
+    assert len(logs) == (5 if status == "not_configured" else 11 if status == "ok" else 10)
+    assert expected in logs
+    assert sum(x.startswith("🔎 Exa call") for x in logs) == (0 if status == "not_configured" else 3)
     assert "PRIVATE" not in str(logs) + caplog.text
     assert "mock-exa-credential" not in str(logs) + caplog.text
     assert model.calls == (5 if status == "ok" else 2)
@@ -139,11 +140,13 @@ def test_agent_can_call_exa_then_weather_and_send_one_reply(monkeypatch):
     weather = AsyncMock(return_value={"status": "ok", "location": "Montreal, Quebec, Canada"})
     monkeypatch.setattr(bot, "get_weather", weather)
     asyncio.run(bot.ask_agent(message))
-    assert transport.await_count == 2
-    weather.assert_awaited_once_with("Montreal", "2026-09-13", "19:00")
-    assert model.calls == 3
+    assert transport.await_count == 3
+    assert weather.await_count == 2  # verified event has no time: whole-day differs from 19:00
+    weather.assert_any_await("Montreal, Quebec, Canada", "2026-09-13", "19:00")
+    assert model.calls == 6  # attempts to finish without ranking are continued
     assert len(model.tool_outputs) == 2
-    assert [call.args[0].split()[0] for call in audit.send.call_args_list] == ["📚", "🔎", "🔧"]
+    assert sum(call.args[0].startswith("🔧") for call in audit.send.call_args_list) == 2
+    assert sum(call.args[0].startswith("🔎 Exa call") for call in audit.send.call_args_list) == 3
     message.channel.send.assert_awaited_once()
 
 

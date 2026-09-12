@@ -1,17 +1,36 @@
 """Per-request forecast identity, time selection and source-backed summaries."""
 
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
+from events import runtime_now
 
 from weather import describe_conditions, planning_guidance
 
 
-def weather_key(location: str, day: str) -> tuple[str, str]:
+def normalize_forecast_request(location: str, day: str, local_time: str | None = None) -> tuple[str, str, str | None]:
+    now = runtime_now()
+    day = day.strip()
+    relative = day.casefold()
+    if relative in ("today", "tomorrow", "now"):
+        day = (now.date() + timedelta(days=relative == "tomorrow")).isoformat()
+        if relative == "now" and local_time is None:
+            local_time = now.strftime("%H:00")
+    city = " ".join(location.split())
+    if unicodedata.normalize("NFKD", city.casefold()).replace("\u0301", "") in ("montreal", "montreal, quebec, canada"):
+        city = "Montreal, Quebec, Canada"
+    if local_time:
+        local_time = event_time({"time": local_time}) or local_time
+        local_time = local_time[:2] + ":00"
+    return city, day, local_time
+
+
+def weather_key(location: str, day: str, local_time: str | None = None) -> tuple[str, str, str | None]:
+    location, day, local_time = normalize_forecast_request(location, day, local_time)
     city = " ".join("".join(c for c in unicodedata.normalize("NFKD", location.casefold())
                              if not unicodedata.combining(c)).split())
     if city in ("montreal", "montreal, quebec, canada"):
         city = "montreal, quebec, canada"
-    return city, day
+    return city, day, local_time
 
 
 def event_time(event: dict) -> str | None:
@@ -27,7 +46,7 @@ def event_time(event: dict) -> str | None:
 
 
 def forecast_for_event(event: dict, cache: dict) -> dict:
-    forecast = cache.get(weather_key(event["location"], event["date"]), {})
+    forecast = cache.get(weather_key(event["location"], event["date"], event_time(event)), {})
     rows = forecast.get("hourly_forecasts", [])
     if forecast.get("status") != "ok" or not rows:
         return forecast

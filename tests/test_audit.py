@@ -1,3 +1,4 @@
+from event_weather import normalize_forecast_request
 import asyncio
 import json
 from types import SimpleNamespace
@@ -59,14 +60,15 @@ def test_actual_tool_execution_logs_once_with_returned_status(monkeypatch, statu
             context=None, tool_name="get_weather", tool_call_id="weather", tool_arguments=arguments,
         ), arguments)
         assert returned == result
-        lookup.assert_awaited_once_with("Montreal", "now", None)
+        lookup.assert_awaited_once_with(*normalize_forecast_request("Montreal", "now", None))
         assert log.send.await_count == 2  # exactly one additional tool audit
         return SimpleNamespace(final_output="User-facing answer")
 
     monkeypatch.setattr(bot.Runner, "run", run)
     asyncio.run(bot.ask_agent(SimpleNamespace(content="Check Montreal weather now", guild=guild, channel=general)))
-    location = result.get("location", "Montreal")
-    expected = f"🔧 get_weather | {location} | now | {icon} {status}"
+    location = result.get("location", "Montreal, Quebec, Canada")
+    _, day, hour = normalize_forecast_request("Montreal", "now")
+    expected = f"🔧 get_weather | {location} | {day} {hour} | {icon} {status}"
     if status == "ok":
         expected += " | Open-Meteo"
     assert log.send.call_args.args[0] == expected

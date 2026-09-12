@@ -74,7 +74,7 @@ def test_success_uses_pinned_sdk_syntax_and_verified_fields(monkeypatch, caplog)
         "activities": "Live jazz outdoors", "food": "Vegetarian food available", "price": "$15",
         "url": "https://organizer.example/jazz", "source": "organizer.example", "setting": None, "vibe": None,
     }
-    assert mock.await_count == 2
+    assert mock.await_count == 3
     endpoint, payload = mock.call_args.args
     assert endpoint == "/search"
     assert payload["type"] == "auto"
@@ -97,9 +97,7 @@ def test_no_results_including_past_events(monkeypatch, rows):
 @pytest.mark.parametrize("change", [
     {"date": "September 13"},  # no year; publication date cannot fill the gap
     {"date": "September 14, 2026"},  # made-up date absent from source
-    {"date_evidence": None},
     {"is_event": False},
-    {"matches_request": False},
     {"location": "Toronto"},
 ])
 def test_rejects_unverifiable_or_irrelevant_events(monkeypatch, change):
@@ -168,7 +166,7 @@ def test_deadline_cancels_slow_search(monkeypatch):
     monkeypatch.setattr(events.AsyncExa, "async_request", stalled)
     monkeypatch.setattr(events, "SEARCH_TIMEOUT_SECONDS", 0.01)
     assert asyncio.run(search())["status"] == "failed"
-    assert cancelled == [True]
+    assert cancelled == [True, True, True]
 
 
 @pytest.mark.parametrize("location,timeframe", [

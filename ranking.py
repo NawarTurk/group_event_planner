@@ -1,4 +1,4 @@
-"""Evidence-gated OR scoring; preference values come only from Discord context."""
+"""Validate and render agent comparisons without choosing the event order."""
 
 from typing import Literal
 
@@ -13,6 +13,7 @@ class Criterion(BaseModel):
     preference: str
     source_message: str
     kind: Literal["general", "weather"] = "general"
+    category: Literal["Food", "Price", "Day/time", "Vibe/interests", "Setting", "Weather", "Other"] = "Other"
     weather_policy: Literal["restricted", "unrestricted"] = "restricted"
 
 
@@ -29,31 +30,33 @@ def rank_candidates(
     candidates: list[dict], preferences: dict[str, list[str]],
     criteria: list[Criterion], assessments: list[Assessment], forecasts: dict | None = None,
 ) -> list[dict]:
-    """One point per match, minus one per conflict, plus the weakest user's net score.
+    """Preserve the agent's order; unsupported or missing claims become unknown.
 
-    The weakest-user bonus favours balanced matches. Missing assessments or
-    unsupported claims become unknown. No intersection or food/price filter exists.
+    Numeric counts are diagnostic only and never select or sort recommendations.
     """
+    # Invalid or omitted extraction must not discard verified events.
+    valid = []
     ids = set()
     covered = set()
     for criterion in criteria:
-        if criterion.id in ids:
-            raise ValueError("Criterion IDs must be unique")
+        if (criterion.id in ids or criterion.source_message not in preferences.get(criterion.person, [])
+                or not criterion.preference.strip()
+                or criterion.preference.casefold() not in criterion.source_message.casefold()):
+            continue
+        valid.append(criterion)
         ids.add(criterion.id)
-        if criterion.source_message not in preferences.get(criterion.person, []):
-            raise ValueError("Preference must reference a current Discord message")
-        if not criterion.preference.strip() or criterion.preference.casefold() not in criterion.source_message.casefold():
-            raise ValueError("Preference must be quoted from its source")
         covered.add((criterion.person, criterion.source_message))
     for person, messages in preferences.items():
-        for message in messages:
+        for index, message in enumerate(messages):
             if (person, message) not in covered:
-                raise ValueError("Every preference message needs its criteria evaluated")
+                valid.append(Criterion(id=f"missing:{person}:{index}", person=person,
+                    label="Preference", preference=message, source_message=message))
+    criteria = valid
     by_key = {}
     for item in assessments:
         key = (item.event_url, item.criterion_id)
         if key in by_key:
-            raise ValueError("Each event/criterion pair must be assessed once")
+            continue
         by_key[key] = item
     ranked = []
     for event in candidates:
@@ -64,7 +67,7 @@ def rank_candidates(
             if criterion.kind == "weather":
                 continue  # aggregated into one real-forecast criterion per person below
             item = by_key.get((event["url"], criterion.id))
-            status, reason = "unknown", "Not confirmed by the event source"
+            status, reason = "unknown", "Not confirmed from available information"
             if item:
                 value = event.get(item.evidence_field)
                 supported = (item.evidence_field not in ("url", "source") and
@@ -76,7 +79,7 @@ def rank_candidates(
             conflicts += status == "conflict"
             scores[criterion.person] += (status == "match") - (status == "conflict")
             comparisons[criterion.person].append({"label": criterion.label, "preference": criterion.preference,
-                                                  "status": status, "reason": reason})
+                                                  "status": status, "reason": reason, "category": criterion.category})
         if forecasts is not None:
             forecast = forecast_for_event(event, forecasts)
             brief = forecast_brief(forecast)
@@ -106,7 +109,7 @@ def rank_candidates(
                             decisions.append("unknown")
                     status = "conflict" if "conflict" in decisions else "unknown" if "unknown" in decisions else "match"
                     reason = "; ".join(reasons) if reasons else f"Compatibility not confirmed; forecast is {brief}"
-                comparisons[person].append({"label": "Weather", "status": status, "reason": reason})
+                comparisons[person].append({"label": "Weather", "status": status, "reason": reason, "category": "Weather"})
                 scores[person] += (status == "match") - (status == "conflict")
                 matches += status == "match"
                 conflicts += status == "conflict"
@@ -117,7 +120,7 @@ def rank_candidates(
         if forecasts is not None and forecast.get("status") == "ok":
             warnings = " ".join(forecast.get("warnings", []))
             ranked[-1]["weather_note"] = f"{brief}. {warnings} Source: Open-Meteo."
-    return sorted(ranked, key=lambda row: (row["score"], row["balance"], row["matches"], -row["conflicts"]), reverse=True)[:3]
+    return ranked
 
 
 def render_scorecards(ranked: list[dict]) -> str:
@@ -129,11 +132,28 @@ def render_scorecards(ranked: list[dict]) -> str:
                  f"📍 {event.get('venue') or 'Venue not confirmed'} | {event['location']}", f"🔗 <{event['url']}>"]
         if row.get("weather_note"):
             lines.append(f"Weather: {row['weather_note']}")
+        # These are display categories, not personal preferences or search filters.
+        categories = ["Food", "Price", "Day/time", "Vibe/interests", "Setting", "Weather"]
+        grouped = {person: {} for person in row["comparisons"]}
         for person, checks in row["comparisons"].items():
-            lines.extend(["", person])
-            if not checks:
-                lines.append("❓ Preferences not available")
             for check in checks:
-                lines.append(f"{symbols[check['status']]} {check['label']}: {check['reason']}")
+                category = check.get("category", "Other")
+                if category == "Other":
+                    category = check["label"]
+                if category not in categories:
+                    categories.append(category)
+                grouped[person].setdefault(category, []).append(check)
+        people = list(row["comparisons"])
+        def cell(value: str) -> str:
+            return " ".join(value.split()).replace("|", "\\|")
+        lines.extend(["", "| Criterion | " + " | ".join(cell(p) for p in people) + " |",
+                      "| --- | " + " | ".join("---" for _ in people) + " |"])
+        for category in categories:
+            values = []
+            for person in people:
+                checks = grouped[person].get(category, [])
+                values.append("; ".join(f"{symbols[c['status']]} {cell(c['label'])}: {cell(c['reason'])}"
+                                        for c in checks) if checks else "❓ Not confirmed")
+            lines.append(f"| {cell(category)} | " + " | ".join(values) + " |")
         cards.append("\n".join(lines))
     return "\n\n".join(cards)

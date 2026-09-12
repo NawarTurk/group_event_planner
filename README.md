@@ -63,13 +63,17 @@ No calendar dates or user preference values are stored in production code.
 
 Search uses the official `exa-py==2.14.0` async SDK, `type="auto"`, and the
 [Exa search guide](https://docs.exa.ai/reference/search-api-guide-for-coding-agents)
-syntax. It requests 15 candidates by default, using only location and calculated
+syntax. It requests up to 15 candidates by default, using only location and calculated
 timeframe—never preferences. If fewer than three verified candidates survive,
-it retries once with a simpler city/timeframe query, then deduplicates both sets.
+it tries a simpler city/timeframe query, then broad OR categories (music, art, food,
+movies, technology, social, creative). Failed calls also proceed to these fallbacks.
+Results from every successful call are merged and deduplicated; missing optional
+fields and imperfect preference matches never discard an event.
 Each request has a 30-second timeout. Exa is never called without its key.
 
 Verification requires a source URL, page-backed title, explicit full event date,
-and matching city. Publication date is not event date. Past dates and known
+and matching city. Title and date can appear separately on an event page; an
+Exa compatibility judgment does not veto verified facts. Publication date is not event date. Past dates and known
 already-started events today are excluded. Unknown same-day times are labeled
 unconfirmed. Fields without source support become null; food, price, venue, vibe,
 and setting are optional. Current date parsing accepts ISO and full English dates;
@@ -78,25 +82,25 @@ to source-backed details, not independently confirmed ticket availability.
 
 After broad search, the same primary agent extracts every stated criterion from
 the current Discord messages and assesses every candidate separately for each
-person. The local `rank_events` tool checks source references, fills omitted or
-unsupported assessments as `❓ Not confirmed`, and performs the ranking in Python:
+person. The primary agent chooses the best-first event order using confirmed
+matches, conflicts, and balance across both people. It submits that order and its
+comparisons to `rank_events`; Python validates source evidence and renders the
+agent's order without sorting or selecting by scores. Missing or unsupported
+assessments become `❓ Not confirmed from available information`, never a reason
+to discard verified events. Default output is three events, up to five when asked;
+fewer available events are shown with the verified count, without fabrication.
 
-- Each `✅ Confirmed match` adds one point.
-- Each `❌ Confirmed conflict` subtracts one point.
-- Unknowns add zero; optional missing fields never remove an event.
-- The weakest user's net score is added as a balance bonus, then the top three
-  are selected. No perfect intersection is required.
+All distinct criteria are requested in the agent instructions. If the model omits
+a whole preference message, a fallback unknown row preserves that message's
+preference rather than failing the response. Edits are fetched on the next request.
+Tests mock semantic judgments and check evidence validation, order, and rendering;
+they do not establish a live model's extraction accuracy.
 
-Each criterion is rendered separately, including conflicts. The model interprets
-the natural-language preferences and comparisons; tests simulate those judgments
-while verifying source gates, coverage, scores, and rendering. A source message
-must be covered, and all its distinct criteria are requested in the instructions.
-Edits are fetched on the very next request, with no preference cache.
-
-Exa completion logs initially show the real candidate count. After Python ranks
-the results, that same audit message is updated to show `N candidates, M ranked`.
-No ranking count is claimed before ranking executes. Existing startup, preference,
-and weather logs remain application-generated.
+Exa logs only its real retrieved candidate count. After an agent comparison
+submission is processed, a separate application-generated `📊 Ranked events`
+message records candidates and shown counts. If the model never submits comparisons,
+verified facts and unknown rows still appear, without claiming ranking completed.
+Existing startup, preference, and weather logs remain application-generated.
 
 Scorecards include each person's available criteria, verified source links, and
 relevant retrieved weather. They are sent in one Discord reply. Longer comparisons
@@ -168,14 +172,29 @@ are preserved.
 Forecasts use [Open-Meteo](https://open-meteo.com/en/docs), with city resolution
 through its [geocoding API](https://open-meteo.com/en/docs/geocoding-api).
 Every request uses `ModelSettings(tool_choice="auto", parallel_tool_calls=False)`.
-The model decides whether weather matters, and the SDK runs its normal tool loop.
-There is no keyword routing or manual change to tool choice. The wrapper executes
-each requested lookup with its own arguments and sends only the final Discord answer.
+The model selects tools semantically, and the SDK runs its normal tool loop.
+Every event search returning candidates requires weather before recommendations:
+preferences → search → agent selects candidates → weather → agent compares and ranks.
+An application completion check uses actual search execution state, with no keyword
+routing or manual change to tool choice. Premature model completion triggers the
+missing weather checks and continuation; incomplete comparisons become unknown rows. Empty searches do not trigger weather.
+
+`event_weather.py` resolves relative dates using the configured local runtime clock
+before calling Open-Meteo or caching. Keys contain normalized location, ISO date,
+and event hour (or whole day). Relative and ISO requests for the same hour share
+one real lookup; different hours, dates, or locations get separate lookups. Every
+real lookup retains its audit log with the resolved date.
+Every person's scorecard includes Weather, compared against their freshly loaded
+preferences. Accepting any weather earns a match; missing preferences and forecasts
+outside Open-Meteo's range remain unknown. Actual safety warnings still appear,
+including when someone has no weather restriction. Only one final Discord reply
+is sent after the required checks complete.
 Mock-model tests verify tool configuration, execution, result feedback, and the
 no-tool path; they do not prove a live model's semantic choices or response length.
 
 Dates must be within today through 15 days ahead in the resolved location's
-timezone. `today`, `tomorrow`, and `now` are resolved there, not in the server timezone.
+timezone. The Discord wrapper resolves relative dates using `LOCAL_TIMEZONE`;
+explicit event dates and starting times come from the verified event data.
 Minutes select the containing forecast hour. Date-only requests summarize the
 whole day, including overnight; hourly requests are better for activity planning.
 Precipitation probability includes snow, not just rain.
@@ -185,3 +204,36 @@ chance at least 40%, or fog/rain/snow/storm codes favor indoors. Below 15°C add
 jacket warning. These are planning hints, not official weather alerts.
 On API failure or incomplete data, the tool reports weather unavailable.
 # group_event_planner
+
+
+Event timeframes accept month names (optionally a year), this week, next week,
+this weekend, exact dates/ranges, and today/tomorrow. A current month means its
+remaining days; an upcoming month means its entire calendar month. No timeframe
+uses the next 30 days (`EVENT_SEARCH_DAYS` can override this). The default location
+is `Montreal, Quebec, Canada` via `DEFAULT_EVENT_LOCATION`. The default city's
+explicit `LOCAL_TIMEZONE` is honored; other cities are geocoded for their timezone.
+Montreal uses America/Toronto. Date resolution and same-day past-event exclusion
+run inside that event timezone. Configuration and API failures are reported as
+failures, not evidence that no events exist.
+
+Additional audit messages report the resolved range/timezone, every real Exa
+attempt's status and returned count, and retrieved versus usable deduplicated
+counts. Existing preference counts, weather execution and comparison/display
+counts remain separate. All logs come from application execution metadata.
+
+Try `Find events in Montreal in September` or simply `Find events` in #general.
+The agent should search without asking for a specific date, return verified links,
+and compare the available facts with both people's current preferences.
+
+
+Each event scorecard includes a side-by-side Criterion / Nawar / Akash table:
+Food, Price, Day/time, Vibe/interests, Setting, and Weather. The agent assigns
+current preferences to these display categories; additional criteria are preserved.
+Missing preferences or source evidence remain ❓. No minimum compatibility score
+removes a verified event. Multiple criteria within a category remain separate
+checks in that person's cell. Source links stay outside the table for clicking.
+
+The application logs `Exa search started` before invoking retrieval and
+`Candidates passed to agent` immediately before returning the tool result.
+After Discord successfully accepts the one response, it logs `Events displayed`.
+Ranking/display counts are never logged as delivered when Discord rejects the send.
